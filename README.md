@@ -361,6 +361,7 @@ delivery-management-system/
 |
 `-- docs/
     `-- ERD.png                      Entity-relationship diagram (12 entities)
+    `-- ERDRelationalSchema.png      Relational schema diagram
 ```
 
 ---
