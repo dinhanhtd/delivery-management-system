@@ -31,12 +31,23 @@ LOG_DIR     = Path(__file__).parent / ".." / "logs"
 # ─────────────────────────────────────────────────────────────
 BACKUP_DIR.mkdir(parents=True, exist_ok=True) 
 
+
 import sys
 import os
-# Thêm thư mục chứa backup.py (cùng cấp với logger.py) vào sys.path
-# insert(0, ...) ưu tiên thư mục này hơn các package cùng tên khác
-sys.path.insert(0, os.path.abspath(os.path.dirname(__file__)))
-from logger import app_logger as _log  # type: ignore
+
+# Thêm parent directory (root project) vào sys.path
+parent_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+sys.path.insert(0, parent_dir)
+
+try:
+    from logger import app_logger as _log
+except ImportError:
+    import logging
+    _log = logging.getLogger(__name__)
+    _log.setLevel(logging.INFO)
+    handler = logging.StreamHandler()
+    handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+    _log.addHandler(handler)
 
 # ─────────────────────────────────────────────────────────────
 # Helper: tạo file .my.cnf tạm để không lộ password trên CLI
