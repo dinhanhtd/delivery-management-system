@@ -1,0 +1,27 @@
+# =============================================================
+# requirements.txt — Delivery Service Management System
+# Python 3.10+ required
+# Install: pip install -r requirements.txt
+# =============================================================
+
+# Web application framework
+streamlit>=1.35.0
+
+# MySQL database driver
+mysql-connector-python>=9.0.0
+
+# Password hashing
+bcrypt>=4.1.0
+
+# Data manipulation and analysis
+pandas>=2.2.0
+
+# Interactive charts and visualizations
+plotly>=5.20.0
+
+# Realistic sample data generation (scripts/generate_data.py)
+Faker>=25.0.0
+
+# Standard library modules used (no install needed):
+#   logging, argparse, subprocess, gzip, shutil, pathlib,
+#   datetime, csv, io, os, sys, random, dataclasses, typing
