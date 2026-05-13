@@ -13,23 +13,17 @@ from faker import Faker
 # ─────────────────────────────────────────────────────────
 # CONFIG
 # ─────────────────────────────────────────────────────────
-# LƯU Ý BẢO MẬT: Script này dùng tài khoản root vì cần quyền:
-#   • TRUNCATE TABLE (app_service chỉ có SELECT/INSERT/UPDATE/DELETE)
-#   • SET foreign_key_checks = 0 (cần SUPER hoặc SESSION_VARIABLES_ADMIN)
-# Script này chỉ chạy MỘT LẦN trong quá trình setup ban đầu,
-# KHÔNG dùng trong môi trường production.
-# Thay mật khẩu bên dưới cho phù hợp với cài đặt MySQL của bạn.
 DB_CONFIG = {
     "host":     "localhost",
     "port":     3306,
     "user":     "root",
-    "password": "1234",        # ← Thay bằng mật khẩu root thực của bạn
+    "password": "1234",       
     "database": "delivery_db",
     "charset":  "utf8mb4",
     "autocommit": False,
 }
 
-ROWS = 15   # so dong mau toi thieu cho moi bang chinh
+ROWS = 150  # so dong mau cho moi bang chinh 
 
 fake = Faker("vi_VN")
 Faker.seed(42)
@@ -94,15 +88,27 @@ def gen_users() -> list:
             "Email":        f"{uname}@delivery.vn",
             "IsActive":     1,
         })
+    # Users là bảng hệ thống (staff), không scale theo ROWS.
+    # Chỉ sinh thêm 10 random users cố định để tránh hàng trăm bcrypt calls chậm.
+    # Với ROWS=150, nếu để range(ROWS-5)=145 bcrypt(rounds=12) → ~60 giây chờ.
     roles = ["delivery_manager","dispatcher","accountant"]
-    for i in range(max(0, ROWS - len(predefined))):
+    used_unames = {u for u, _, _, _ in predefined}
+    used_emails = {f"{u}@delivery.vn" for u, _, _, _ in predefined}
+    for i in range(10):
         uname = fake.user_name() + str(random.randint(10,99))
+        while uname in used_unames:
+            uname = fake.user_name() + str(random.randint(10,99))
+        used_unames.add(uname)
+        email = fake.email()
+        while email in used_emails:
+            email = fake.email()
+        used_emails.add(email)
         users.append({
             "Username":     uname,
             "PasswordHash": hash_pw(fake.password(length=10, special_chars=True)),
             "Role":         random.choice(roles),
             "FullName":     fake.name(),
-            "Email":        fake.email(),
+            "Email":        email,
             "IsActive":     random.choice([1,1,1,0]),
         })
     return users
@@ -141,14 +147,29 @@ def gen_customers(n: int) -> list:
         "Hai Phong":        ["Hong Bang","Le Chan","Ngo Quyen"],
         "Can Tho":          ["Ninh Kieu","Binh Thuy","Cai Rang"],
     }
+    used_phones = set()
+    used_emails = set()
     custs = []
     for _ in range(n):
         city     = random.choice(list(cities))
         district = random.choice(cities[city])
+
+        # Dedup SĐT — tránh lỗi UNIQUE constraint khi ROWS lớn
+        phone = vn_phone()
+        while phone in used_phones:
+            phone = vn_phone()
+        used_phones.add(phone)
+
+        # Dedup email — Faker có thể sinh trùng tại ROWS lớn
+        email = fake.email()
+        while email in used_emails:
+            email = fake.email()
+        used_emails.add(email)
+
         custs.append({
             "CustomerName": fake.name(),
-            "PhoneNumber":  vn_phone(),
-            "Email":        fake.email(),
+            "PhoneNumber":  phone,
+            "Email":        email,
             "Address":      f"So {random.randint(1,200)}, Duong so {random.randint(1,50)}, {district}, {city}",
             "Ward":         f"Phuong {random.randint(1,10)}",
             "District":     district,
@@ -203,15 +224,6 @@ def gen_vehicles(n: int) -> list:
 
 
 def gen_orders(n: int, cust_ids: list, cat_ids: list) -> list:
-    """
-    Logic thời gian phụ thuộc vào Status của đơn hàng:
-      - pending / assigned / in_transit (đơn đang chạy):
-            OrderDate lùi tối đa 1–48 giờ → deadline vẫn còn trong tương lai,
-            tránh HoursRemaining bị âm rất nặng trên giao diện.
-      - delivered / failed / returned (đơn đã kết thúc):
-            OrderDate lùi 0–30 ngày → phản ánh lịch sử thực tế.
-      DeadlineDate luôn = OrderDate + 24..72 giờ (trigger không bị vi phạm).
-    """
     # Status được chọn TRƯỚC để quyết định khoảng thời gian order_date
     active_statuses   = ["pending", "assigned", "in_transit"]
     finished_statuses = ["delivered", "failed", "returned"]
@@ -236,17 +248,14 @@ def gen_orders(n: int, cust_ids: list, cat_ids: list) -> list:
 
         # Bước 2: tính order_date dựa vào status
         if status in active_statuses:
-            # Đơn đang chạy → chỉ lùi 1–48 giờ, deadline vẫn dương
             order_date = datetime.datetime.now() - datetime.timedelta(
-                hours=random.randint(1, 48)
+                hours=random.randint(1, 23)
             )
         else:
-            # Đơn đã kết thúc → lùi 3–30 ngày (đủ xa để phản ánh lịch sử)
             order_date = datetime.datetime.now() - datetime.timedelta(
                 days=random.randint(3, 30)
             )
 
-        # Bước 3: deadline luôn sau order_date 24–72 giờ
         deadline = order_date + datetime.timedelta(hours=random.randint(24, 72))
 
         orders.append({
@@ -278,10 +287,12 @@ def gen_deliveries(n: int, order_ids: list, veh_ids: list,
     Returns: (list_of_dicts_to_insert, list_of_info_dicts)
     """
     drivers = [
-        ("Nguyen Van An","0901234567"), ("Tran Thi Binh","0912345678"),
-        ("Le Van Chien","0923456789"),  ("Pham Thi Dung","0934567890"),
-        ("Hoang Van Em","0945678901"),  ("Vu Thi Phuong","0956789012"),
-        ("Dang Van Giang","0967890123"),("Bui Thi Hanh","0978901234"),
+        ("Nguyen Van An","0901234567"),   ("Tran Thi Binh","0912345678"),
+        ("Le Van Chien","0923456789"),    ("Pham Thi Dung","0934567890"),
+        ("Hoang Van Em","0945678901"),    ("Vu Thi Phuong","0956789012"),
+        ("Dang Van Giang","0967890123"),  ("Bui Thi Hanh","0978901234"),
+        ("Nguyen Thi Lan","0911223344"),  ("Tran Van Minh","0922334455"),
+        ("Le Thi Ngoc","0933445566"),     ("Pham Van Phuc","0944556677"),
     ]
     statuses = ["scheduled","in_progress","completed","failed","returned"]
     delivs_to_insert = []
@@ -299,15 +310,16 @@ def gen_deliveries(n: int, order_ids: list, veh_ids: list,
         else:
             order_date_d = order_date
 
-        # Schedule 0–3 days after order (never before)
-        sched = order_date_d + datetime.timedelta(days=random.randint(0, 3))
+        # Window 0–7 ngày (mở rộng từ 0–3) để giảm xung đột vehicle-date
+        # 150 vehicles × 8-day window = 1200 slots cho 150 deliveries → xung đột gần như 0
+        sched = order_date_d + datetime.timedelta(days=random.randint(0, 7))
 
         tries = 0
-        while (vid, str(sched)) in used_veh_dates and tries < 20:
+        while (vid, str(sched)) in used_veh_dates and tries < 30:
             vid   = random.choice(veh_ids)
-            sched = order_date_d + datetime.timedelta(days=random.randint(0, 3))
+            sched = order_date_d + datetime.timedelta(days=random.randint(0, 7))
             tries += 1
-        if tries >= 20:
+        if tries >= 30:
             continue
         used_veh_dates.add((vid, str(sched)))
 
@@ -515,8 +527,10 @@ def main():
     conn.commit()
     print("✓ Da xoa du lieu cu")
 
-    # 1. Users
-    print(f"  Sinh {max(ROWS,5)} Users (bcrypt — co the cham)...")
+    # 1. Users (15 tài khoản cố định: 5 predefined + 10 random)
+    # Giữ cố định 15 users bất kể ROWS — Users là bảng hệ thống, không phải khách hàng.
+    # Tránh sinh ROWS-5=145 bcrypt hashes chậm (mỗi hash ~0.4s × 145 = ~58 giây).
+    print("  Sinh 15 Users (5 predefined + 10 random, bcrypt rounds=12)...")
     user_ids = bulk_insert(cur, "Users", gen_users())
     conn.commit()
     print(f"✓ Users: {len(user_ids)} dong")
