@@ -37,13 +37,13 @@ The system covers the complete delivery lifecycle: customer management, order cl
 - 5 stored procedures wrapping critical write paths in ACID transactions
 - 4 user-defined functions for aggregated analytics
 - 7 triggers for data integrity, automation, and business rule enforcement
-- 11 single-column indexes and 6 composite indexes targeting the most frequent query patterns
+- 12 single-column indexes and 6 composite indexes targeting the most frequent query patterns
 - 3 MySQL roles for database-level access control
 
 ### Application Layer (Python 3.10 / Streamlit)
 
 - Browser-based GUI with 9 functional pages routed by sidebar navigation
-- bcrypt password hashing at cost factor 12; brute-force protection via account lockout after 5 failed attempts
+- bcrypt password hashing at cost factor 12; brute-force protection via `AuthManager` singleton (5 failed attempts → 15-minute lockout at the application layer, plus MySQL-level `FAILED_LOGIN_ATTEMPTS 5` on direct database accounts)
 - `MySQLConnectionPool` with a pool size of 5 for efficient connection reuse
 - Role-based permission enforcement at the UI layer via `ROLE_PERMS` in `streamlit_app.py`
 - Rotating file logging separated into three streams: application events, database queries, and audit trail
@@ -73,14 +73,14 @@ Orders are classified across five categories defined in the `OrderCategories` ta
 | `fragile_high_value` | 12 | Yes | Yes | Van, Truck |
 | `refrigerated` | 12 | No | No | Refrigerated Truck only |
 
-The `IsFragile` and `IsHighValue` flags drive validation inside `sp_assign_delivery`, which rejects vehicle assignments that violate the category's `AllowedVehicleTypes` or the vehicle's `CanCarryFragile` flag. The `IsHighValue` flag is set automatically by trigger when `DeclaredValueVND` exceeds 5,000,000 VND.
+The `IsFragile` and `IsHighValue` flags drive validation inside `sp_assign_delivery`, which rejects vehicle assignments that violate the category's `AllowedVehicleTypes`, exceed the vehicle's `MaxValueVND` insurance cap, or violate the vehicle's `CanCarryFragile` flag. The `IsHighValue` flag is set automatically by trigger when `DeclaredValueVND` exceeds 5,000,000 VND.
 
 ### Security Model
 
-- Passwords are stored exclusively as bcrypt hashes. The `auth.py` module's `AuthManager` class handles login, lockout, and password change flows. Plain-text passwords are never persisted or logged.
+- Passwords are stored exclusively as bcrypt hashes (cost factor 12). The `auth.py` module's `AuthManager` class handles login, app-layer lockout (5 failed attempts → 15-minute lockout, state held in a `@st.cache_resource` singleton across Streamlit reruns), and password change flows. Plain-text passwords are never persisted or logged.
+- A second defense layer is enforced at the MySQL server level: the role-based accounts (`dm_user`, `dispatcher_user`, `accountant_user`) are created with `FAILED_LOGIN_ATTEMPTS 5` and `PASSWORD_LOCK_TIME 1`, locking the MySQL account for one day after five wrong attempts.
 - The Python application connects using the `app_service` MySQL account, which holds only `SELECT`, `INSERT`, `UPDATE`, `DELETE`, and `EXECUTE` privileges on `delivery_db`.
-- Three additional MySQL accounts (`dm_user`, `dispatcher_user`, `accountant_user`) are granted their respective roles and can be used for direct database access with appropriate privilege segregation.
-- All authentication events — successful logins, failures, lockouts, logouts, and password changes — are written to `logs/audit.log` via a dedicated `audit_logger`.
+- All authentication events — `LOGIN_OK`, `LOGIN_FAIL`, `ACCOUNT_LOCKED`, `LOGIN_BLOCKED`, `LOGOUT`, `PASSWORD_CHANGED`, `PASSWORD_CHANGE_FAIL` — are written to `logs/audit.log` via a dedicated `audit_logger`.
 
 ### Customer Intelligence
 
@@ -115,7 +115,7 @@ The `vw_customer_order_summary` view and the `fn_customer_risk_level` UDF classi
 ### 1. Clone the repository
 
 ```bash
-git clone https://github.com/your-username/delivery-management-system.git
+git clone https://github.com/dinhanhtd/delivery-management-system.git
 cd delivery-management-system
 ```
 
@@ -146,13 +146,13 @@ pip install -r requirements.txt
 Connect to MySQL as root and execute the schema script. This script creates the `delivery_db` database, all 12 tables, indexes, views, stored procedures, user-defined functions, triggers, and database roles.
 
 ```bash
-mysql -u root -p < database/schema.sql
+mysql -u root -p < schema.sql
 ```
 
 ### 5. Create MySQL application users
 
 ```bash
-mysql -u root -p < database/create_mysql_users.sql
+mysql -u root -p < create_mysql_users.sql
 ```
 
 This creates four accounts (`dm_user`, `dispatcher_user`, `accountant_user`, `app_service`) and assigns their respective roles. The `app_service` account is used by the Python application.
@@ -160,12 +160,12 @@ This creates four accounts (`dm_user`, `dispatcher_user`, `accountant_user`, `ap
 ### 6. Generate sample data
 
 ```bash
-python scripts/generate_data.py
+python generate_data.py
 ```
 
 This inserts approximately **150 rows** per main table using realistic Vietnamese locale data generated by Faker. On completion it runs a self-test that validates all views, UDFs, and the date-validation trigger.
 
-> **Note:** `generate_data.py` uses the MySQL `root` account because it requires `TRUNCATE` and `SET foreign_key_checks = 0` privileges that the `app_service` account does not hold. Update the `DB_PASSWORD` field in `scripts/generate_data.py` to match your local root password before running.
+> **Note:** `generate_data.py` uses the MySQL `root` account because it requires `TRUNCATE` and `SET foreign_key_checks = 0` privileges that the `app_service` account does not hold. Update the `DB_PASSWORD` field in `generate_data.py` to match your local root password before running.
 
 ---
 
@@ -195,7 +195,7 @@ DB_CONFIG = {
 
 `streamlit_app.py` defines its own inline `DB_CONFIG` that includes `pool_name` and `pool_size` for the connection pool. Update the `password` field here as well if you changed the `app_service` password.
 
-### Backup credentials — `scripts/backup.py`
+### Backup credentials — `backup.py`
 
 `backup.py` connects as the `root` account to run `mysqldump`. Update `DB_PASSWORD` at the top of the file to match your MySQL root password.
 
@@ -225,7 +225,7 @@ Open a browser at `http://localhost:8501`.
 
 ## Default Login Credentials
 
-These accounts are created by `scripts/generate_data.py`. Change passwords after initial setup.
+These accounts are created by `generate_data.py`. Change passwords after initial setup.
 
 | Username | Password | Role |
 |---|---|---|
@@ -272,7 +272,7 @@ These accounts are created by `scripts/generate_data.py`. Change passwords after
 
 | Procedure | Description |
 |---|---|
-| `sp_assign_delivery(order_id, vehicle_id, driver_name, driver_phone, sched_date, OUT delivery_id, OUT message)` | Validates order status (`pending`), vehicle availability, and fragile-carry compatibility. Creates the `Deliveries` record, sets the order to `assigned` and the vehicle to `in_use`. All writes are in a single ACID transaction. |
+| `sp_assign_delivery(order_id, vehicle_id, driver_name, driver_phone, sched_date, OUT delivery_id, OUT message)` | Validates order status (`pending`), vehicle availability, fragile-carry compatibility, `MaxValueVND` insurance cap, and `AllowedVehicleTypes` from the order category. Creates the `Deliveries` record, sets the order to `assigned` and the vehicle to `in_use`. All writes are in a single ACID transaction. |
 | `sp_smart_reschedule(delivery_id, failure_reason, notes, OUT status, OUT message)` | Records a failed attempt, appends a `failed_attempt` expense entry, and applies decision logic: retry with customer-preferred slot, escalate to `OrderIssues`, or mark as returned after 3 attempts. |
 | `sp_resolve_issue(issue_id, resolution, notes, OUT status, OUT message)` | Marks an issue resolved, optionally updates the parent order to `returned`, and inserts a compensation expense for high/critical refund resolutions. |
 | `sp_resolve_issue_v2(issue_id, resolution, resolution_notes)` | Idempotent variant. Updates only when the current `Resolution` is `pending`; uses `ROW_COUNT()` to detect stale or missing records and signals a descriptive error. |
@@ -317,25 +317,27 @@ The `app_service` account holds `SELECT`, `INSERT`, `UPDATE`, `DELETE`, and `EXE
 
 ## Backup and Restore
 
-`scripts/backup.py` wraps `mysqldump` with the `--single-transaction`, `--routines`, `--triggers`, and `--events` flags to produce a consistent, fully restorable snapshot. The output is gzip-compressed. Backups older than 7 days are purged automatically.
+`backup.py` wraps `mysqldump` with the `--single-transaction`, `--routines`, `--triggers`, and `--events` flags to produce a consistent, fully restorable snapshot. The output is gzip-compressed. Backups older than 7 days are purged automatically.
 
 ```bash
 # Create a new backup (saved to backups/ at project root)
-python scripts/backup.py
+python backup.py
 
 # List existing backup files
-python scripts/backup.py --list
+python backup.py --list
 
 # Restore from a specific backup file
-python scripts/backup.py --restore backups/delivery_db_YYYYMMDD_HHMMSS.sql.gz
+python backup.py --restore backups/delivery_db_YYYYMMDD_HHMMSS.sql.gz
 
 # Override the retention period
-python scripts/backup.py --keep-days 14
+python backup.py --keep-days 14
 ```
 
 ---
 
 ## Project Structure
+
+The repository uses a **flat top-level layout** — all source files live at the project root for simplicity.
 
 ```
 delivery-management-system/
@@ -343,25 +345,20 @@ delivery-management-system/
 |-- README.md                        Project documentation
 |-- .gitignore                       Git ignore rules
 |-- requirements.txt                 Python dependency list
-|-- LICENSE                          MIT License
 |
 |-- streamlit_app.py                 Main application entry point (run with streamlit run)
 |-- auth.py                          AuthManager: bcrypt login, lockout, session, password change
 |-- db_config.py                     DB_CONFIG and DB_POOL_CONFIG; Tables, Views, Procedures, Functions constants
 |-- logger.py                        Rotating file log setup: app_logger, db_logger, audit_logger
 |
-|-- database/
-|   |-- schema.sql                   Full DDL: 12 tables, indexes, 7 views, 5 SPs, 4 UDFs, 7 triggers, 3 roles
-|   |-- create_mysql_users.sql       MySQL user accounts and role grants
-|   `-- optimize.sql                 EXPLAIN-based query optimization analysis for all major queries
+|-- generate_data.py                 Faker-based sample data generator (~150 rows/table, requires MySQL root)
+|-- backup.py                        mysqldump backup, gzip compression, retention management, restore
 |
-|-- scripts/
-|   |-- generate_data.py             Faker-based sample data generator — 150 rows/table (requires MySQL root)
-|   `-- backup.py                    mysqldump backup, gzip compression, retention management, restore
+|-- schema.sql                       Full DDL: 12 tables, 18 indexes, 7 views, 5 SPs, 4 UDFs, 7 triggers, 3 roles
+|-- create_mysql_users.sql           MySQL user accounts and role grants
+|-- optimize.sql                     EXPLAIN-based query optimization analysis
 |
-`-- docs/
-    `-- ERD.png                      Entity-relationship diagram (12 entities)
-    `-- ERDRelationalSchema.png      Relational schema diagram
+`-- FinalProjectERD.png              Entity-relationship diagram (12 entities)
 ```
 
 ---

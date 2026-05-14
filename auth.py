@@ -236,14 +236,38 @@ class AuthManager:
         """
         Đổi mật khẩu. Yêu cầu xác nhận mật khẩu cũ.
         Mật khẩu mới phải dài ít nhất 8 ký tự.
+
+        Note: KHÔNG gọi self.login() ở đây vì nó sẽ record fail
+        và có thể khoá tài khoản. Verify trực tiếp bằng bcrypt.
         """
         if len(new_password) < 8:
             return False, "Mật khẩu mới phải có ít nhất 8 ký tự."
 
-        # Xác thực mật khẩu cũ trước
-        session, err = self.login(username, old_password)
-        if not session:
-            return False, f"Xác thực thất bại: {err}"
+        # Verify old password trực tiếp với DB — KHÔNG đụng vào _fail_count
+        try:
+            conn   = self._get_connection()
+            cursor = conn.cursor(dictionary=True)
+            cursor.execute(
+                "SELECT PasswordHash, IsActive FROM Users WHERE Username=%s",
+                (username,)
+            )
+            row = cursor.fetchone()
+            cursor.close()
+            conn.close()
+        except mysql.connector.Error as e:
+            return False, f"Lỗi DB khi xác thực: {e}"
+
+        if not row:
+            return False, "Tài khoản không tồn tại."
+        if not row["IsActive"]:
+            return False, "Tài khoản đã bị vô hiệu hoá."
+
+        if not bcrypt.checkpw(
+            old_password.encode("utf-8"),
+            row["PasswordHash"].encode("utf-8")
+        ):
+            _audit.warning(f"PASSWORD_CHANGE_FAIL | user={username} | reason=wrong_old_password")
+            return False, "Mật khẩu cũ không đúng."
 
         # Băm mật khẩu mới
         new_hash = bcrypt.hashpw(
@@ -323,6 +347,11 @@ class AuthManager:
         self._fail_count[username] = self._fail_count.get(username, 0) + 1
         if self._fail_count[username] >= self.MAX_ATTEMPTS:
             self._lockout[username] = datetime.datetime.now()
+            _audit.warning(
+                f"ACCOUNT_LOCKED | user={username} "
+                f"| attempts={self._fail_count[username]} "
+                f"| lock_minutes={self.LOCKOUT_MINUTES}"
+            )
 
     # ── Trạng thái hiện tại ───────────────────────────────────
     @property

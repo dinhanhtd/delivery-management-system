@@ -622,10 +622,14 @@ sp_assign_delivery: BEGIN
     DECLARE v_veh_avail     VARCHAR(20);
     DECLARE v_is_fragile    BOOLEAN;
     DECLARE v_can_fragile   BOOLEAN;
+    DECLARE v_declared_val  BIGINT;
+    DECLARE v_max_value     BIGINT;
+    DECLARE v_vehicle_type  VARCHAR(30);
+    DECLARE v_allowed_types VARCHAR(100);
 
     -- All validation BEFORE starting transaction (read-only checks)
-    SELECT Status, IsFragile
-    INTO   v_order_status, v_is_fragile
+    SELECT Status, IsFragile, DeclaredValueVND
+    INTO   v_order_status, v_is_fragile, v_declared_val
     FROM   Orders WHERE OrderID = p_order_id;
 
     IF v_order_status IS NULL THEN
@@ -640,8 +644,8 @@ sp_assign_delivery: BEGIN
         LEAVE sp_assign_delivery;
     END IF;
 
-    SELECT Availability, CanCarryFragile
-    INTO   v_veh_avail, v_can_fragile
+    SELECT Availability, CanCarryFragile, VehicleType, MaxValueVND
+    INTO   v_veh_avail, v_can_fragile, v_vehicle_type, v_max_value
     FROM   Vehicles WHERE VehicleID = p_vehicle_id;
 
     IF v_veh_avail IS NULL THEN
@@ -658,6 +662,32 @@ sp_assign_delivery: BEGIN
 
     IF v_is_fragile = TRUE AND v_can_fragile = FALSE THEN
         SET p_message = 'ERROR: This vehicle cannot carry fragile items';
+        SET p_delivery_id = -1;
+        LEAVE sp_assign_delivery;
+    END IF;
+
+    -- [NEW] Check MaxValueVND: vehicle insurance cap must cover declared value
+    IF v_max_value IS NOT NULL AND v_declared_val > v_max_value THEN
+        SET p_message = CONCAT('ERROR: Order value (',
+                               FORMAT(v_declared_val, 0),
+                               ' VND) exceeds vehicle max insurable value (',
+                               FORMAT(v_max_value, 0), ' VND)');
+        SET p_delivery_id = -1;
+        LEAVE sp_assign_delivery;
+    END IF;
+
+    -- [NEW] Check AllowedVehicleTypes from OrderCategories
+    SELECT oc.AllowedVehicleTypes
+    INTO   v_allowed_types
+    FROM   Orders o
+    JOIN   OrderCategories oc ON o.CategoryID = oc.CategoryID
+    WHERE  o.OrderID = p_order_id;
+
+    IF v_allowed_types IS NOT NULL
+       AND FIND_IN_SET(v_vehicle_type, v_allowed_types) = 0 THEN
+        SET p_message = CONCAT('ERROR: Vehicle type "', v_vehicle_type,
+                               '" not allowed for this category. Allowed: ',
+                               v_allowed_types);
         SET p_delivery_id = -1;
         LEAVE sp_assign_delivery;
     END IF;

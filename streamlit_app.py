@@ -444,6 +444,20 @@ def db_action_logger(func):
             return pd.DataFrame() if func.__name__ == 'run_query' else (False if func.__name__ == 'run_exec' else (False, None, ""))
     return wrapper
 
+# ── AuthManager singleton — giữ trạng thái lockout xuyên rerun ──
+from auth import AuthManager
+
+@st.cache_resource
+def get_auth_manager():
+    """
+    Tạo 1 instance AuthManager dùng chung cho toàn bộ session Streamlit.
+    @st.cache_resource đảm bảo _fail_count và _lockout không bị reset
+    sau mỗi lần Streamlit rerun (mỗi lần user click button).
+    """
+    # AuthManager dùng connect() trực tiếp, tự lọc bỏ pool keys
+    return AuthManager(DB_CONFIG)
+
+
 @db_action_logger
 def run_query(sql: str, params=None) -> pd.DataFrame:
     conn = get_conn()
@@ -572,26 +586,28 @@ def render_delivery_timeline(delivery_id: int):
 # AUTH
 # ══════════════════════════════════════════════════════════
 def do_login(username: str, password: str):
-    df = run_query(
-        "SELECT * FROM Users WHERE Username=%s AND IsActive=1",
-        (username,)
-    )
-    if df.empty:
-        # Log failed login: user not found or inactive
-        audit_logger.warning(f"LOGIN_FAIL | user={username} | reason=not_found_or_inactive | ip=streamlit_session")
-        return None
-    row = df.iloc[0]
-    try:
-        if bcrypt.checkpw(password.encode(), row["PasswordHash"].encode()):
-            audit_logger.info(
-                f"LOGIN_OK | user={username} | role={row['Role']} "
-                f"| id={row['UserID']}"
-            )
-            return row.to_dict()
-    except Exception:
-        pass
-    audit_logger.warning(f"LOGIN_FAIL | user={username} | reason=wrong_password")
-    return None
+    """
+    Delegate sang AuthManager (auth.py) để có đầy đủ:
+      - bcrypt verify
+      - đếm số lần sai
+      - khoá tài khoản sau MAX_ATTEMPTS lần sai (15 phút)
+      - audit log: LOGIN_OK / LOGIN_FAIL / ACCOUNT_LOCKED / LOGIN_BLOCKED
+
+    Returns:
+        (user_dict, "")    nếu thành công
+        (None, error_msg)  nếu thất bại — error_msg đã localize (vd: 'Còn 3 lần thử')
+    """
+    auth = get_auth_manager()
+    session, err = auth.login(username, password)
+    if session:
+        return {
+            "Username": session.username,
+            "FullName": session.full_name,
+            "Role":     session.role,
+            "UserID":   session.user_id,
+            "Email":    session.email,
+        }, ""
+    return None, err
 
 
 def can(section: str) -> bool:
@@ -674,7 +690,7 @@ def show_login_page():
                 st.error("Vui lòng nhập đầy đủ.")
             else:
                 with st.spinner("Đang xác thực..."):
-                    user = do_login(username.strip(), password)
+                    user, err = do_login(username.strip(), password)
                 if user:
                     st.session_state.update({
                         "user":      user["Username"],
@@ -685,7 +701,12 @@ def show_login_page():
                     })
                     st.rerun()
                 else:
-                    st.error("Sai tên đăng nhập hoặc mật khẩu.")
+                    # err có thể là:
+                    #   - "Sai tên đăng nhập hoặc mật khẩu."
+                    #   - "Sai mật khẩu. Còn N lần thử."
+                    #   - "Tài khoản bị khóa 15 phút do nhập sai nhiều lần."
+                    #   - "Tài khoản tạm khóa. Thử lại sau N phút."
+                    st.error(err or "Đăng nhập thất bại.")
 
         st.markdown("""
 <div style="background:#161923;border:1px solid #2a3050;border-radius:8px;
@@ -815,14 +836,17 @@ def page_dashboard():
         st.dataframe(df, use_container_width=True, hide_index=True)
 
     elif view == "pending":
-        st.markdown("##### Đơn chờ xử lý")
+        st.markdown("##### Đơn chờ xử lý (vw_outstanding_orders)")
+        # Dùng View vw_outstanding_orders — hide JOIN complexity,
+        # auto compute HoursRemaining từ DeadlineDate
         df2 = run_query("""
-            SELECT o.OrderID, c.CustomerName, o.RecipientName,
-                   FORMAT(o.DeclaredValueVND,0) AS GiaTri,
-                   DATE(o.DeadlineDate) AS Deadline,
-                   o.IsFragile, o.IsHighValue
-            FROM Orders o JOIN Customers c ON o.CustomerID=c.CustomerID
-            WHERE o.Status='pending' ORDER BY o.DeadlineDate ASC LIMIT 30""")
+            SELECT OrderID, CustomerName, RecipientName,
+                   DeliveryAddress, DeadlineDate, HoursRemaining,
+                   IsFragile, IsHighValue, Status
+            FROM   vw_outstanding_orders
+            WHERE  Status = 'pending'
+            ORDER  BY DeadlineDate ASC
+            LIMIT  30""")
         if df2.empty:
             st.success("Không có đơn chờ xử lý!")
         else:
@@ -845,17 +869,30 @@ def page_dashboard():
             st.dataframe(df3, use_container_width=True, hide_index=True)
 
     elif view == "fail":
-        st.markdown("##### Lịch sử giao thất bại")
-        df4 = run_query("""
-            SELECT da.DeliveryID, da.AttemptNumber, da.AttemptTime,
-                   da.FailureReason, da.ContactAttempted,
-                   da.NextAttemptScheduled
-            FROM DeliveryAttempts da
-            ORDER BY da.AttemptTime DESC LIMIT 30""")
-        if df4.empty:
-            st.success("Không có lần giao thất bại!")
+        st.markdown("##### Tổng hợp giao thất bại (vw_failed_attempts_summary)")
+        # Dùng View vw_failed_attempts_summary —
+        # gom nhóm theo DeliveryID, thay vì list từng attempt
+        df_summary = run_query("""
+            SELECT DeliveryID, OrderID, RecipientName, RecipientPhone,
+                   DeliveryAddress, TotalAttempts, LastAttemptNumber,
+                   LastAttemptTime, LastFailureReason, NextScheduled
+            FROM   vw_failed_attempts_summary
+            ORDER  BY LastAttemptTime DESC
+            LIMIT  20""")
+        if df_summary.empty:
+            st.success("Không có chuyến giao nào thất bại!")
         else:
-            st.dataframe(df4, use_container_width=True, hide_index=True)
+            st.dataframe(df_summary, use_container_width=True, hide_index=True)
+
+            # Bổ sung danh sách raw attempts mới nhất để tra cứu chi tiết
+            with st.expander("Chi tiết từng lần thất bại (DeliveryAttempts)"):
+                df4 = run_query("""
+                    SELECT da.DeliveryID, da.AttemptNumber, da.AttemptTime,
+                           da.FailureReason, da.ContactAttempted,
+                           da.NextAttemptScheduled
+                    FROM DeliveryAttempts da
+                    ORDER BY da.AttemptTime DESC LIMIT 30""")
+                st.dataframe(df4, use_container_width=True, hide_index=True)
 
     elif view == "risk":
         st.markdown("##### Đơn hàng rủi ro cao")
@@ -1017,9 +1054,10 @@ def page_issues():
 def page_customers():
     st.header("Quản lý khách hàng")
 
-    t1, t2, t3, t4 = st.tabs([
+    t1, t2, t3, t4, t5 = st.tabs([
         "Danh sách", "Thêm / Sửa / Xóa",
-        "Chi tiết khách hàng", "Customer Intelligence"
+        "Chi tiết khách hàng", "Customer Intelligence",
+        "Tuỳ chọn giao hàng (Preferences)"
     ])
 
     with t1:
@@ -1301,6 +1339,145 @@ def page_customers():
             st.plotly_chart(fig2, use_container_width=True)
             st.dataframe(df_sum, use_container_width=True, hide_index=True)
 
+    # ── TAB 5: CustomerPreferences — giờ giao ưa thích, blackout window ──
+    # Bảng CustomerPreferences nuôi sp_smart_reschedule (chọn khung giờ retry)
+    with t5:
+        st.subheader("Tuỳ chọn giao hàng theo khách hàng (CustomerPreferences)")
+        st.caption("Khi sp_smart_reschedule lên lịch lại đơn thất bại, "
+                   "nó đọc PreferredTimeSlot từ bảng này để đặt giờ giao kế tiếp.")
+
+        # Danh sách preferences hiện có
+        df_pref = run_query("""
+            SELECT cp.PreferenceID, cp.CustomerID, c.CustomerName,
+                   cp.PreferredTimeSlot, cp.BlackoutStart, cp.BlackoutEnd,
+                   cp.ContactMethod, cp.MaxDailyAttempts,
+                   cp.SpecialNotes, cp.UpdatedAt
+            FROM   CustomerPreferences cp
+            JOIN   Customers c ON cp.CustomerID = c.CustomerID
+            ORDER  BY cp.UpdatedAt DESC
+            LIMIT  100""")
+        if not df_pref.empty:
+            st.dataframe(df_pref, use_container_width=True, hide_index=True)
+        else:
+            st.info("Chưa có preference nào.")
+
+        st.divider()
+
+        # Form thêm mới / cập nhật preference
+        st.markdown("**Thêm / Cập nhật preference cho 1 khách hàng**")
+        st.caption("Bảng có UNIQUE(CustomerID): nếu CustomerID đã tồn tại → UPSERT (cập nhật).")
+
+        custs_for_pref = run_query(
+            "SELECT CustomerID, CustomerName, PhoneNumber FROM Customers ORDER BY CustomerName")
+
+        if "pref_form_key" not in st.session_state:
+            st.session_state["pref_form_key"] = 0
+
+        pref_sub = False
+        sel_cust = None
+
+        with st.form(f"pref_form_{st.session_state['pref_form_key']}"):
+            if custs_for_pref.empty:
+                st.warning("Chưa có khách hàng nào — thêm khách hàng trước.")
+                st.form_submit_button("Lưu", disabled=True)
+            else:
+                pref_cust_map = {
+                    f"#{r.CustomerID} - {r.CustomerName} ({r.PhoneNumber})": r.CustomerID
+                    for r in custs_for_pref.itertuples()
+                }
+                pc1, pc2 = st.columns(2)
+                with pc1:
+                    sel_cust = st.selectbox("Khách hàng *", list(pref_cust_map.keys()))
+                    pref_slot = st.selectbox(
+                        "Khung giờ ưa thích *",
+                        ["anytime", "morning", "afternoon", "evening"],
+                        format_func=lambda x: SLOT_LABELS.get(x, x)
+                    )
+                    pref_contact = st.selectbox(
+                        "Phương thức liên hệ *",
+                        ["any", "call", "sms", "email"]
+                    )
+                    pref_max_att = st.number_input(
+                        "Số lần thử tối đa/ngày",
+                        min_value=1, max_value=5, value=3, step=1
+                    )
+                with pc2:
+                    pref_bs = st.time_input(
+                        "Không làm phiền từ (BlackoutStart)",
+                        value=None
+                    )
+                    pref_be = st.time_input(
+                        "Đến (BlackoutEnd)",
+                        value=None
+                    )
+                    pref_notes = st.text_area(
+                        "Ghi chú đặc biệt",
+                        height=100,
+                        placeholder="VD: Chỉ giao khi có người nhà, gọi 30p trước..."
+                    )
+
+                pref_sub = st.form_submit_button(
+                    "Lưu preference (UPSERT)",
+                    type="primary",
+                    use_container_width=True
+                )
+
+        if pref_sub and sel_cust is not None and not custs_for_pref.empty:
+            try:
+                conn_p = get_conn()
+                cur_p  = conn_p.cursor()
+                # UPSERT: nếu CustomerID đã có row → update
+                cur_p.execute(
+                    """INSERT INTO CustomerPreferences
+                       (CustomerID, PreferredTimeSlot, BlackoutStart, BlackoutEnd,
+                        ContactMethod, MaxDailyAttempts, SpecialNotes)
+                       VALUES (%s,%s,%s,%s,%s,%s,%s)
+                       ON DUPLICATE KEY UPDATE
+                           PreferredTimeSlot = VALUES(PreferredTimeSlot),
+                           BlackoutStart     = VALUES(BlackoutStart),
+                           BlackoutEnd       = VALUES(BlackoutEnd),
+                           ContactMethod     = VALUES(ContactMethod),
+                           MaxDailyAttempts  = VALUES(MaxDailyAttempts),
+                           SpecialNotes      = VALUES(SpecialNotes)""",
+                    (pref_cust_map[sel_cust],
+                     pref_slot,
+                     pref_bs.strftime("%H:%M:%S") if pref_bs else None,
+                     pref_be.strftime("%H:%M:%S") if pref_be else None,
+                     pref_contact,
+                     int(pref_max_att),
+                     pref_notes or None)
+                )
+                conn_p.commit()
+                cur_p.close()
+                conn_p.close()
+                st.session_state["pref_form_key"] += 1
+                st.success(f"Đã lưu preference cho CustomerID = {pref_cust_map[sel_cust]}")
+                time.sleep(1.5)
+                st.rerun()
+            except Exception as e:
+                st.error(f"Lỗi lưu preference: {e}")
+
+        st.divider()
+
+        # Xoá preference (CASCADE đã có khi xoá Customers; tại đây chỉ xoá pref)
+        st.markdown("**Xoá preference**")
+        cd1, cd2 = st.columns([2, 1])
+        with cd1:
+            del_pref_cid = st.number_input(
+                "CustomerID có preference cần xoá",
+                min_value=1, step=1, key="del_pref_cid"
+            )
+        with cd2:
+            st.markdown("<br>", unsafe_allow_html=True)
+            if st.button("Xoá preference", type="secondary", use_container_width=True):
+                if run_exec(
+                    "DELETE FROM CustomerPreferences WHERE CustomerID=%s",
+                    (del_pref_cid,)
+                ):
+                    st.success(f"Đã xoá preference của CustomerID = {del_pref_cid}")
+                    time.sleep(1.5)
+                    st.rerun()
+
 
 # ══════════════════════════════════════════════════════════
 # ORDERS
@@ -1476,13 +1653,29 @@ TỔNG CỘNG       : {total:>15,.0f} VND
 def page_deliveries():
     st.header("Giao hàng")
 
-    df = run_query("""
-        SELECT d.DeliveryID, o.OrderID, d.DriverName, d.DriverPhone,
-               d.ScheduledDate, d.Status, v.LicensePlate, v.VehicleType,
-               o.RecipientName, o.IsFragile, o.IsHighValue
-        FROM Deliveries d JOIN Orders   o ON d.OrderID   = o.OrderID
-        JOIN Vehicles   v ON d.VehicleID = v.VehicleID
-        ORDER BY d.ScheduledDate DESC LIMIT 200""")
+    # Toggle giữa bảng full vs view vw_current_schedule (chỉ active)
+    only_active = st.toggle(
+        "Chỉ hiển thị chuyến đang/sắp giao (vw_current_schedule)",
+        value=False,
+        help="Bật để dùng View vw_current_schedule — chỉ status 'scheduled' hoặc 'in_progress'"
+    )
+
+    if only_active:
+        df = run_query("""
+            SELECT DeliveryID, OrderID, DriverName, DriverPhone,
+                   ScheduledDate, DeliveryStatus AS Status,
+                   LicensePlate, VehicleType,
+                   RecipientName, IsFragile, IsHighValue, CategoryName
+            FROM   vw_current_schedule
+            LIMIT  200""")
+    else:
+        df = run_query("""
+            SELECT d.DeliveryID, o.OrderID, d.DriverName, d.DriverPhone,
+                   d.ScheduledDate, d.Status, v.LicensePlate, v.VehicleType,
+                   o.RecipientName, o.IsFragile, o.IsHighValue
+            FROM Deliveries d JOIN Orders   o ON d.OrderID   = o.OrderID
+            JOIN Vehicles   v ON d.VehicleID = v.VehicleID
+            ORDER BY d.ScheduledDate DESC LIMIT 200""")
     st.dataframe(df, use_container_width=True, hide_index=True)
 
     t1, t2, t3, t4, t5 = st.tabs([
@@ -1502,8 +1695,9 @@ def page_deliveries():
             st.markdown("**Danh sách đơn hàng đang chờ phân công tài xế:**")
             st.dataframe(df_pending, use_container_width=True, hide_index=True)
             if st.button("Phân công ngay", type="primary", use_container_width=True):
+                # Dùng vw_available_vehicles để lấy xe rảnh (hide JOIN-and-filter)
                 v_row = run_query(
-                    "SELECT VehicleID FROM Vehicles WHERE Availability='available' LIMIT 1")
+                    "SELECT VehicleID FROM vw_available_vehicles LIMIT 1")
                 if v_row.empty:
                     st.error("Không còn xe rảnh.")
                 else:
@@ -1526,8 +1720,12 @@ def page_deliveries():
                                FROM Orders o
                                JOIN Customers c ON o.CustomerID=c.CustomerID
                                WHERE o.Status='pending'""")
-        avail_v = run_query(
-            "SELECT VehicleID,VehicleType,LicensePlate FROM Vehicles WHERE Availability='available'")
+        # Dùng vw_available_vehicles — chỉ liệt kê xe đang available
+        # và đã sẵn các cột MaxValueVND, CanCarryFragile để dispatcher đối chiếu
+        avail_v = run_query("""
+            SELECT VehicleID, VehicleType, LicensePlate,
+                   MaxWeightKg, MaxValueVND, CanCarryFragile
+            FROM   vw_available_vehicles""")
 
         with st.form("assign_form"):
             if pending.empty:
@@ -1580,8 +1778,7 @@ def page_deliveries():
                        WHERE d.DeliveryID=%s""", (did_upd,))
                 ok = run_exec(
                     """UPDATE Deliveries
-                       SET Status='completed', ActualDeliveryTime=NOW(),
-                           RecipientSignature=1
+                       SET Status='completed', ActualDeliveryTime=NOW()
                        WHERE DeliveryID=%s""", (did_upd,))
                 if ok and not info.empty:
                     t3_msg_ph.success(f"Chuyến giao #{did_upd} đã HOÀN THÀNH.")
@@ -1805,6 +2002,33 @@ def page_expenses():
         JOIN Orders o ON d.OrderID=o.OrderID
         ORDER BY e.ExpenseDate DESC LIMIT 200""")
     st.dataframe(df, use_container_width=True, hide_index=True)
+
+    # ── Tra cứu chi phí 1 chuyến giao (gọi sp_get_delivery_cost) ──
+    with st.expander("Tra cứu chi phí của 1 chuyến giao (sp_get_delivery_cost)"):
+        st.caption("Stored Procedure sp_get_delivery_cost trả về (TotalAmount, Breakdown)")
+        c_inp, c_btn = st.columns([2, 1])
+        with c_inp:
+            did_cost = st.number_input(
+                "DeliveryID", min_value=1, step=1, key="cost_did"
+            )
+        with c_btn:
+            st.markdown("<br>", unsafe_allow_html=True)
+            btn_cost = st.button("Tính tổng chi phí", use_container_width=True)
+
+        if btn_cost:
+            ok, res, err = call_sp(
+                "sp_get_delivery_cost",
+                [int(did_cost)],
+                out_count=2
+            )
+            if ok and res:
+                total_amount = float(res[0] or 0)
+                breakdown    = res[1] or "(chua co chi phi)"
+                mc1, mc2 = st.columns([1, 2])
+                mc1.metric("Tổng chi phí", f"{total_amount:,.0f} VND")
+                mc2.markdown(f"**Chi tiết:** {breakdown}")
+            else:
+                st.error(err or "Không tính được chi phí.")
 
     with st.expander("Thêm chi phí"):
         delivs = run_query("""
