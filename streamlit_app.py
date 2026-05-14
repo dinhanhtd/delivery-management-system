@@ -1326,18 +1326,109 @@ def page_customers():
                     st.info("Khách hàng này chưa có đơn hàng nào.")
 
     with t4:
-        st.subheader("Tổng quan Customer Intelligence")
-        df_sum = run_query("SELECT * FROM vw_customer_order_summary ORDER BY SuccessRatePct ASC")
-        if not df_sum.empty:
-            fig2 = px.bar(df_sum.head(15), x="CustomerName", y="SuccessRatePct",
-                          color="SuccessRatePct",
-                          color_continuous_scale=["red","orange","green"],
-                          title="Tỉ lệ giao thành công theo khách hàng (%)",
-                          text_auto=True)
-            fig2.update_layout(paper_bgcolor="rgba(0,0,0,0)",
-                               plot_bgcolor="rgba(0,0,0,0)", font_color="#c8d3f5")
-            st.plotly_chart(fig2, use_container_width=True)
-            st.dataframe(df_sum, use_container_width=True, hide_index=True)
+        st.subheader("Customer Risk & Performance Analysis")
+        
+        df_cust_risk = run_query("""
+            SELECT 
+                c.CustomerID,
+                c.CustomerName,
+                COUNT(DISTINCT o.OrderID) AS TotalOrders,
+                SUM(o.Status='delivered') AS DeliveredOrders,
+                SUM(o.Status='failed') AS FailedOrders,
+                COUNT(DISTINCT da.AttemptID) AS TotalAttempts,
+                ROUND(COALESCE(SUM(o.DeclaredValueVND),0)/1e6, 2) AS TotalValueM,
+                fn_customer_risk_level(c.CustomerID) AS RiskLevel,
+                fn_customer_success_rate(c.CustomerID) AS SuccessRate
+            FROM Customers c
+            LEFT JOIN Orders o ON c.CustomerID = o.CustomerID
+            LEFT JOIN Deliveries d ON o.OrderID = d.OrderID
+            LEFT JOIN DeliveryAttempts da ON d.DeliveryID = da.DeliveryID
+            GROUP BY c.CustomerID, c.CustomerName
+            HAVING TotalOrders > 0
+            ORDER BY RiskLevel DESC, FailedOrders DESC
+        """)
+        
+        if not df_cust_risk.empty:
+            col_pie, col_metric = st.columns([2, 2])
+            
+            with col_pie:
+                risk_counts = df_cust_risk['RiskLevel'].value_counts()
+                try:
+                    fig_risk = px.pie(
+                        names=risk_counts.index,
+                        values=risk_counts.values,
+                        title="Customer Risk Distribution",
+                        color_discrete_map={
+                            "critical": "#ef4444",
+                            "high": "#f97316", 
+                            "medium": "#f59e0b",
+                            "low": "#10b981"
+                        }
+                    )
+                    fig_risk.update_layout(
+                        paper_bgcolor="rgba(0,0,0,0)",
+                        font_color="#c8d3f5"
+                    )
+                    st.plotly_chart(fig_risk, use_container_width=True)
+                except Exception as e:
+                    st.warning(f"Risk chart: {e}")
+            
+            with col_metric:
+                total_custs = len(df_cust_risk)
+                avg_success = df_cust_risk['SuccessRate'].mean()
+                high_risk_count = len(df_cust_risk[df_cust_risk['RiskLevel'].isin(['high', 'critical'])])
+                
+                st.metric("Total Customers (with orders)", f"{total_custs:,}")
+                st.metric("Avg Success Rate", f"{avg_success:.1f}%")
+                st.metric("⚠️ High/Critical Risk", f"{high_risk_count}")
+            
+            st.divider()
+            st.subheader("Customer Performance Matrix")
+            st.caption("Bubble size = Total Order Value (Triệu VND) | Color = Risk Level")
+            try:
+                fig_scatter = px.scatter(
+                    df_cust_risk,
+                    x='TotalOrders',
+                    y='SuccessRate',
+                    size='TotalValueM',
+                    color='RiskLevel',
+                    hover_name='CustomerName',
+                    hover_data={'TotalOrders': True, 'SuccessRate': ':.1f', 'RiskLevel': True},
+                    title="Performance Matrix: Order Frequency vs Success Rate",
+                    color_discrete_map={
+                        "critical": "#ef4444",
+                        "high": "#f97316",
+                        "medium": "#f59e0b",
+                        "low": "#10b981"
+                    },
+                    size_max=50
+                )
+                fig_scatter.update_layout(
+                    paper_bgcolor="rgba(0,0,0,0)",
+                    plot_bgcolor="rgba(0,0,0,0)",
+                    font_color="#c8d3f5",
+                    xaxis_title="Total Orders",
+                    yaxis_title="Success Rate (%)"
+                )
+                st.plotly_chart(fig_scatter, use_container_width=True)
+            except Exception as e:
+                st.warning(f"Performance chart: {e}")
+            
+            st.divider()
+            st.subheader("⚠️ Customers Needing Attention (High/Critical Risk)")
+            high_risk_custs = df_cust_risk[df_cust_risk['RiskLevel'].isin(['high', 'critical'])].sort_values('FailedOrders', ascending=False)
+            
+            if not high_risk_custs.empty:
+                st.dataframe(high_risk_custs[['CustomerName', 'TotalOrders', 'DeliveredOrders', 'FailedOrders', 'TotalAttempts', 'TotalValueM', 'RiskLevel', 'SuccessRate']], 
+                           use_container_width=True, hide_index=True)
+            else:
+                st.success("✅ Không có khách hàng nào ở mức risk cao/khẩn cấp!")
+            
+            st.divider()
+            st.subheader("📊 Toàn bộ Customer Summary")
+            st.dataframe(df_cust_risk.sort_values('RiskLevel'), use_container_width=True, hide_index=True)
+        else:
+            st.info("Chưa có dữ liệu khách hàng có đơn hàng. Hãy tạo dữ liệu mẫu và cấu trúc order/delivery để phân tích.")
 
     # ── TAB 5: CustomerPreferences — giờ giao ưa thích, blackout window ──
     # Bảng CustomerPreferences nuôi sp_smart_reschedule (chọn khung giờ retry)
@@ -1706,12 +1797,14 @@ def page_deliveries():
                     sched = datetime.date.today().strftime("%Y-%m-%d")
                     ok, res, err = call_sp("sp_assign_delivery",
                         [oid_a, vid_a, "Tài xế tự động", "N/A", sched], out_count=2)
-                    if ok and res:
-                        st.success(f"Phân công tự động thành công cho Đơn #{oid_a}!")
-                        time.sleep(1.5)
+                    sp_ok = ok and res and res[0] is not None and int(res[0]) > 0
+                    if sp_ok:
+                        st.success(f"Phân công tự động thành công cho Đơn #{oid_a}! DeliveryID={res[0]}")
+                        time.sleep(1)
                         st.rerun()
                     else:
-                        st.error(err or "Lỗi không xác định.")
+                        sp_err_msg = (res[1] if res and len(res) > 1 and res[1] else None) or err or "Lỗi không xác định."
+                        st.error(sp_err_msg)
         else:
             st.success("Không có đơn hàng nào đang chờ phân công.")
 
@@ -1752,19 +1845,35 @@ def page_deliveries():
             ok, res, err = call_sp("sp_assign_delivery",
                 [o_sel, v_sel, drv_name, drv_phone or None, str(sched_d)],
                 out_count=2)
-            if ok and res:
+            sp_ok2 = ok and res and res[0] is not None and int(res[0]) > 0
+            if sp_ok2:
                 st.success(f"Đã tạo DeliveryID={res[0]}")
                 icon, title, body = make_notify_body("assigned", {
                     "order_id": o_sel, "driver": drv_name, "date": str(sched_d)})
                 show_notify(icon, title, body, "success")
+                time.sleep(1)
                 st.rerun()
             else:
-                st.error(err or "Lỗi SP")
+                sp_err_msg2 = (res[1] if res and len(res) > 1 and res[1] else None) or err or "Lỗi SP."
+                st.error(sp_err_msg2)
 
     if "fail_form_key" not in st.session_state:
         st.session_state["fail_form_key"] = 0
 
     with t3:
+        if "t3_flash" in st.session_state:
+            kind, msg = st.session_state.pop("t3_flash")
+            if kind == "success":
+                st.success(msg)
+            elif kind == "warning":
+                st.warning(msg)
+            elif kind == "error":
+                st.error(msg)
+            else:
+                st.info(msg)
+        if "t3_notify" in st.session_state:
+            icon, title, body, nkind = st.session_state.pop("t3_notify")
+            show_notify(icon, title, body, nkind)
         t3_msg_ph = st.empty()
         did_upd = st.number_input("DeliveryID cần cập nhật", min_value=1, step=1, key="did_upd")
         c1, c2  = st.columns(2)
@@ -1781,17 +1890,17 @@ def page_deliveries():
                        SET Status='completed', ActualDeliveryTime=NOW()
                        WHERE DeliveryID=%s""", (did_upd,))
                 if ok and not info.empty:
-                    t3_msg_ph.success(f"Chuyến giao #{did_upd} đã HOÀN THÀNH.")
                     row = info.iloc[0]
                     icon, title, body = make_notify_body("delivered", {
                         "order_id": row["OrderID"],
                         "customer_name": row["RecipientName"],
                         "time": datetime.datetime.now().strftime("%d/%m/%Y %H:%M")})
-                    show_notify(icon, title, body, "success")
-                    time.sleep(2)
-                    t3_msg_ph.empty()
+                    st.session_state["t3_flash"] = ("success", f"Chuyến giao #{did_upd} đã HOÀN THÀNH.")
+                    st.session_state["t3_notify"] = (icon, title, body, "success")
+                    st.rerun()
                 else:
-                    t3_msg_ph.error("Không tìm thấy chuyến giao.")
+                    st.session_state["t3_flash"] = ("error", f"Không tìm thấy DeliveryID={did_upd}.")
+                    st.rerun()
 
         with c2:
             st.markdown("**Xử lý thất bại thông minh**")
@@ -1814,19 +1923,21 @@ def page_deliveries():
             if fail_sub:
                 ok, res, err = call_sp("sp_smart_reschedule",
                     [did_upd, reason, notes or None], out_count=2)
-                if ok and res:
-                    status_out, msg_out = res[0], res[1]
+                if ok and res and res[0] not in (None, "ERROR"):
+                    status_out = res[0]
+                    msg_out    = res[1] or ""
                     st.session_state["fail_form_key"] += 1
-                    if status_out in ("RESCHEDULED",):
-                        t3_msg_ph.success(f"{msg_out}")
-                    elif status_out in ("ESCALATED","RETURNED"):
-                        t3_msg_ph.warning(f"{msg_out}")
+                    if status_out == "RESCHEDULED":
+                        st.session_state["t3_flash"] = ("success", f"Lên lịch lại: {msg_out}")
+                    elif status_out in ("ESCALATED", "RETURNED"):
+                        st.session_state["t3_flash"] = ("warning", f"{status_out}: {msg_out}")
                     else:
-                        t3_msg_ph.info(msg_out)
-                    time.sleep(2)
+                        st.session_state["t3_flash"] = ("info", msg_out)
                     st.rerun()
                 else:
-                    t3_msg_ph.error(err or "Lỗi SP")
+                    sp_err = (res[1] if res and len(res) > 1 and res[1] else None) or err or "Lỗi SP."
+                    st.session_state["t3_flash"] = ("error", sp_err)
+                    st.rerun()
 
     with t4:
         st.subheader("Truy vết hành trình đơn hàng")
